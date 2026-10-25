@@ -31,6 +31,7 @@ END = "# <<< Codex turn hold <<<\n"
 
 def migrate_bashrc(text):
     block = BEGIN + SOURCE + END
+    legacy = list(re.finditer("(?m)^" + re.escape(LEGACY_FUNCTION), text))
     if BEGIN in text or END in text:
         if text.count(BEGIN) != 1 or text.count(END) != 1:
             raise ValueError("Ambiguous Codex turn hold markers in .bashrc")
@@ -43,16 +44,16 @@ def migrate_bashrc(text):
             raise ValueError("Custom Codex turn hold block in .bashrc; refusing to overwrite it")
         text = text[:start] + text[finish:]
         insert = start
-    elif LEGACY_FUNCTION in text:
-        if text.count(LEGACY_FUNCTION) != 1:
+    elif legacy:
+        if len(legacy) != 1:
             raise ValueError("Multiple old codex-hold functions in .bashrc")
-        insert = text.index(LEGACY_FUNCTION)
-        text = text[:insert] + text[insert + len(LEGACY_FUNCTION):]
+        insert = legacy[0].start()
+        text = text[:insert] + text[legacy[0].end():]
     else:
         insert = len(text)
         block = "\n" + block
     # Check outside the replaced block too, so another definition cannot override it.
-    if re.search(r"(?m)^\s*(?:function\s+)?codex-hold\s*(?:\(\)|\{)", text):
+    if re.search(r"(?m)^\s*(?:function\s+)?codex-hold\s*(?:\(\s*\)|\{)", text):
         raise ValueError("Unrecognized codex-hold function in .bashrc; refusing to shadow it")
     if "codex-hold.bash" in text:
         raise ValueError("An additional codex-hold source statement exists in .bashrc")
@@ -109,9 +110,12 @@ def install():
     bashrc = home / ".bashrc"
     config = codex_home / "config.toml"
     destination = home / ".local/lib/codex-turn-hold"
-    for path in (bashrc, config, destination):
+    names = ("codex-monitor.py", "codex-hold.bash")
+    for path in (bashrc, config, destination, *(destination / name for name in names)):
         if path.is_symlink():
             raise ValueError(f"Review symlink before installation: {path}")
+    # Read every source before updating anything, including an existing helper.
+    payloads = {name: (root / name).read_bytes() for name in names}
     # Build both migrations and validate Bash before changing installed files.
     old_bashrc = bashrc.read_text() if bashrc.exists() else ""
     new_bashrc = migrate_bashrc(old_bashrc)
@@ -126,7 +130,7 @@ def install():
     backup = state / "codex-turn-hold/backups" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     backup.mkdir(mode=0o700, parents=True)
     originals = {"bashrc": bashrc, "config.toml": config}
-    for name in ("codex-hold.bash", "codex-monitor.py"):
+    for name in names:
         originals[name] = destination / name
     # Record missing originals too, so rollback can distinguish a first install.
     manifest = {"removed_notify": removed_notify, "files": {}}
@@ -140,8 +144,9 @@ def install():
 
     destination.mkdir(mode=0o755, parents=True, exist_ok=True)
     # Install the helper before making the source statement available.
-    for name in ("codex-monitor.py", "codex-hold.bash"):
-        atomic_write(destination / name, (root / name).read_bytes(), 0o644)
+    for name, data in payloads.items():
+        path = destination / name
+        atomic_write(path, data, path.stat().st_mode & 0o777 if path.exists() else 0o644)
     atomic_write(bashrc, new_bashrc.encode(), bashrc.stat().st_mode & 0o777 if bashrc.exists() else 0o644)
     if removed_notify:
         atomic_write(config, new_config.encode(), config.stat().st_mode & 0o777)

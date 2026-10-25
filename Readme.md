@@ -42,7 +42,11 @@ The installer:
 - Removes the top-level `notify` setting only when its value is exactly
   `["bash", "<CODEX_HOME>/turn-done.sh"]`, the dedicated old hook. `CODEX_HOME`
   defaults to `~/.codex`. Other notification commands and configuration stay
-  intact. Existing file permissions are preserved.
+  intact. Existing file permissions are preserved, including those of an
+  already-installed launcher/helper.
+- Reads both source files and validates the migrations before updating the
+  installation. Symlinked configuration files, install directories, and
+  installed launcher/helper files require manual review and are left untouched.
 
 The new monitor never reads, creates, or deletes `/tmp/codex-turn-done`.
 The legacy hook file may remain installed. A running Codex server might continue
@@ -62,7 +66,9 @@ codex-hold
 
 ## How the two timers work
 
-The monitor polls every two seconds. A complete scan has a five-second timeout;
+The monitor polls every two seconds. A complete scan has a five-second deadline
+shared by connection setup and every socket read/write, including fragmented
+responses and WebSocket control messages. Late final responses are rejected;
 slow or failed scans may delay the next poll. Every page and every loaded thread
 is checked, including sub-agents. No conversation is resumed or subscribed to,
 and turn history is not requested.
@@ -89,9 +95,11 @@ checks. Even if another thread reports active work, an incomplete scan enters
 recovery. A failure while already allowing sleep never acquires a speculative
 hold. Recovered idle status after the hold expired also leaves sleep allowed.
 
-Both timers use a monotonic clock. Checks during recovery are bounded by the
-remaining recovery time. A Codex disconnect triggers recovery and reconnection;
-a GNOME session-bus failure is fatal and prints an error. The inhibitor is
+Both timers use a monotonic clock. Codex scans during recovery are bounded by
+the remaining recovery time; a result arriving at or after expiry cannot renew
+the old hold. GNOME D-Bus calls have separate two-second timeouts. A Codex
+disconnect triggers recovery and reconnection; a GNOME session-bus failure is
+fatal and prints an error. The inhibitor is
 owned by a private D-Bus connection and released on Ctrl+C, SIGTERM, SIGHUP,
 or normal cleanup. GNOME removes it if the process crashes or its D-Bus
 connection closes.
@@ -178,8 +186,13 @@ The standard-library tests use a simulated clock and fake transports/inhibitors.
 They cover repeated turns, overlapping conversations, active sub-agents, both
 waiting states, cancellation, startup during work, pagination, malformed
 responses, socket closure, reconnection, both timer boundaries, recovery,
-duplicate locks, cleanup, and conservative migration. They do not touch the
-shared completion marker or change any desktop setting.
+fragment deadlines, redirect rejection, duplicate locks, cleanup, and
+conservative migration. Installer tests use temporary home/state directories
+to check backups, permissions, repeated installs, and failures before writes.
+A launcher test covers relative sourcing with `CDPATH` set. Subprocess tests
+send real SIGINT, SIGTERM, and SIGHUP signals and check duplicate process locks
+using fake desktop/server adapters. These checks do not touch the shared
+completion marker or change any desktop setting.
 
 For a two-turn desktop check, stay at the PC; releasing an inhibitor may permit
 an already-due automatic suspend:
@@ -199,7 +212,18 @@ an already-due automatic suspend:
 
 Actual automatic suspension is not part of these checks.
 
-### Verification on this PC
+### Correctness review
+
+After the fixes to scan deadlines, recovery expiry, and installation, all 47
+tests pass, along with Bash/Python syntax, TOML parsing, and whitespace checks.
+Additional probes using the installed `websocket-client` 1.7.0 verified that
+fragmented responses and repeated ping frames stop at the scan deadline.
+The repository helper's read-only `--check` succeeded against the live Codex
+0.164.0 server; locally generated schemas match the requested status fields.
+ShellCheck was unavailable. Actual suspend and the two-turn desktop lifecycle
+were not exercised during this review, and no installed files were updated.
+
+### Original desktop installation verification
 
 Installed and verified on 2026-10-24 (America/Toronto), with Ubuntu 24.04.5
 GNOME Wayland, Codex CLI 0.164.0, Python 3.12.3, `python3-websocket` 1.7.0-1,

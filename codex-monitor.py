@@ -150,6 +150,32 @@ def read_snapshot(rpc):
     return Snapshot(len(ids), working)
 
 
+class DeadlineSocket:
+    """Apply the scan deadline to every fragment, including WebSocket control traffic."""
+
+    def __init__(self, raw, remaining):
+        self.raw = raw
+        self.remaining = remaining
+
+    def gettimeout(self):
+        return self.remaining()
+
+    def recv(self, size):
+        self.raw.settimeout(self.remaining())
+        data = self.raw.recv(size)
+        self.remaining()
+        return data
+
+    def send(self, data):
+        self.raw.settimeout(self.remaining())
+        sent = self.raw.send(data)
+        self.remaining()
+        return sent
+
+    def __getattr__(self, name):
+        return getattr(self.raw, name)
+
+
 # Reuse one local connection; a failed scan closes it so the next poll reconnects.
 class CodexClient:
     def __init__(self, path, websocket_module, clock=time.monotonic):
@@ -158,6 +184,7 @@ class CodexClient:
         self.clock = clock
         self.ws = None
         self.request_id = 0
+        self.deadline = None
 
     def remaining(self, deadline):
         remaining = deadline - self.clock()
@@ -166,16 +193,23 @@ class CodexClient:
         return remaining
 
     def connect(self, deadline):
+        self.deadline = deadline
         raw = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             raw.settimeout(self.remaining(deadline))
             raw.connect(str(self.path))
             self.ws = self.websocket.WebSocket(enable_multithread=False)
-            # The supplied AF_UNIX socket is the entire transport; no TCP or proxy.
-            self.ws.connect(
-                "ws://localhost/", socket=raw,
-                timeout=self.remaining(deadline), suppress_origin=True,
-            )
+            # Prevent redirects from replacing the supplied Unix socket with TCP.
+            try:
+                self.ws.connect(
+                    "ws://localhost/",
+                    socket=DeadlineSocket(raw, lambda: self.remaining(self.deadline)),
+                    timeout=self.remaining(deadline), suppress_origin=True, redirect_limit=0,
+                )
+            except (ValueError, IndexError) as exc:
+                raise StatusError("Malformed Codex WebSocket handshake") from exc
+            if self.ws.getstatus() != 101:
+                raise StatusError("Codex did not accept the local WebSocket upgrade")
             self.rpc("initialize", {
                 "clientInfo": {"name": "codex_turn_hold", "version": "1.0.0"},
             }, deadline)
@@ -198,7 +232,7 @@ class CodexClient:
                 raise StatusError("Codex connection closed")
             try:
                 message = json.loads(raw)
-            except (ValueError, UnicodeError) as exc:
+            except (ValueError, RecursionError) as exc:
                 raise StatusError("Malformed Codex JSON response") from exc
             if not isinstance(message, dict):
                 raise StatusError("Malformed Codex RPC response")
@@ -216,14 +250,17 @@ class CodexClient:
         # Connection setup, pagination, and all thread reads share one deadline.
         if deadline is None:
             deadline = self.clock() + CHECK_SECONDS
+        self.deadline = deadline
         try:
             if self.ws is None:
                 self.connect(deadline)
-            return read_snapshot(lambda method, params: self.rpc(method, params, deadline))
+            snapshot = read_snapshot(lambda method, params: self.rpc(method, params, deadline))
+            self.remaining(deadline)  # A late final response cannot restart idle grace.
+            return snapshot
         except StatusError:
             self.close()
             raise
-        except (OSError, self.websocket.WebSocketException) as exc:
+        except (OSError, UnicodeError, self.websocket.WebSocketException) as exc:
             self.close()
             raise StatusError(f"Cannot read Codex at {self.path}: {exc}") from exc
 
@@ -308,6 +345,8 @@ class HoldPolicy:
         self.state = "starting"
 
     def success(self, snapshot):
+        # Status received at or after expiry cannot renew the old recovery hold.
+        self.expire_recovery()
         now = self.clock()
         if self.recovery_deadline is not None:
             self.log("Status recovered.")
@@ -362,6 +401,7 @@ def monitor(client, inhibitor, clock=time.monotonic, sleep=time.sleep, log=emit)
         started = clock()
         policy.expire_recovery()
         inhibitor.check_connection()
+        policy.expire_recovery()
         deadline = clock() + CHECK_SECONDS
         # A slow status check must not carry the hold past recovery's deadline.
         if policy.recovery_deadline is not None and inhibitor.held:

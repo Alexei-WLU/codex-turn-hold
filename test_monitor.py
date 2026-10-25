@@ -1,14 +1,18 @@
 """Run with /usr/bin/python3 -B -m unittest -v; no desktop or third-party imports."""
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
+from contextlib import redirect_stdout
 
 
 def load(name, filename):
@@ -156,6 +160,17 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(380, self.policy.recovery_deadline)
         self.assertEqual(["acquire"], self.inhibitor.events)
 
+    def test_idle_at_or_after_recovery_expiry_cannot_extend_hold(self):
+        for at in (182, 183):
+            with self.subTest(at=at):
+                self.setUp()
+                self.ok(0, 1)
+                self.fail(2)
+                self.ok(at)
+                self.assertFalse(self.inhibitor.held)
+                self.assertIsNone(self.policy.idle_deadline)
+                self.assertEqual(["acquire", "release"], self.inhibitor.events)
+
     def test_failure_at_start_never_acquires_and_idle_recovery_stays_unheld(self):
         for at in (0, 100, 180, 500):
             self.fail(at)
@@ -248,6 +263,9 @@ class FakeWebSocket:
     def connect(self, *args, **kwargs):
         self.connect_args = (args, kwargs)
 
+    def getstatus(self):
+        return 101
+
     def settimeout(self, seconds):
         if seconds <= 0:
             raise AssertionError("Unbounded timeout")
@@ -277,6 +295,32 @@ class FakeWebSocket:
         self.closed = True
 
 
+class DeadlineSocketTests(unittest.TestCase):
+    def test_fragments_and_partial_writes_share_one_deadline(self):
+        for operation, argument in (("recv", 1), ("send", b"fragment")):
+            with self.subTest(operation=operation):
+                clock = Clock()
+                client = monitor.CodexClient(Path("/fixture"), Mock(), clock)
+                raw = Mock()
+
+                def transfer(_):
+                    clock.now += 1
+                    return b"x" if operation == "recv" else 1
+
+                getattr(raw, operation).side_effect = transfer
+                transport = monitor.DeadlineSocket(raw, lambda: client.remaining(3))
+                for _ in range(2):
+                    getattr(transport, operation)(argument)
+                with self.assertRaisesRegex(monitor.StatusError, "timed out"):
+                    getattr(transport, operation)(argument)
+                self.assertEqual(3, clock.now)
+                self.assertEqual([3, 2, 1], [call.args[0] for call in raw.settimeout.call_args_list])
+                with self.assertRaises(monitor.StatusError):
+                    transport.gettimeout()
+                transport.close()
+                raw.close.assert_called_once()
+
+
 class ClientTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
@@ -293,7 +337,9 @@ class ClientTests(unittest.TestCase):
             self.assertTrue(broken.closed)
             self.assertIsNone(self.client.ws)
             self.assertEqual(monitor.Snapshot(1, 1), self.client.check())
+            self.clock.now = 100  # The reused connection needs a fresh scan deadline.
             self.assertEqual(monitor.Snapshot(1, 1), self.client.check())
+            self.assertEqual(5, good.connect_args[1]["socket"].gettimeout())
             self.assertEqual(2, raw.call_count)
         self.assertEqual("initialize", good.sent[0]["method"])
         self.assertEqual("initialized", good.sent[1]["method"])
@@ -325,6 +371,47 @@ class ClientTests(unittest.TestCase):
         with self.assertRaisesRegex(monitor.StatusError, "timed out"):
             self.client.check(deadline=5)
         self.assertEqual(5, self.clock.now)
+
+    def test_response_at_or_after_deadline_is_rejected(self):
+        for at in (5, 6):
+            with self.subTest(at=at):
+                self.setUp()
+                self.client.ws = Mock()
+
+                def recv():
+                    self.clock.now = at
+                    return json.dumps({"id": 1, "result": {"data": []}})
+
+                self.client.ws.recv.side_effect = recv
+                with self.assertRaisesRegex(monitor.StatusError, "timed out"):
+                    self.client.check(deadline=5)
+                self.assertIsNone(self.client.ws)
+
+    def test_deeply_nested_json_is_retryable(self):
+        self.client.ws = Mock()
+        self.client.ws.recv.return_value = "[" * 10000 + "0" + "]" * 10000
+        with self.assertRaises(monitor.StatusError):
+            self.client.check()
+        self.assertIsNone(self.client.ws)
+
+    def test_malformed_handshake_is_retryable(self):
+        for error in (ValueError("bad HTTP status"), IndexError("missing HTTP status"),
+                      UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid header")):
+            with self.subTest(error=error), patch.object(monitor.socket, "socket") as raw:
+                self.module.WebSocket.return_value.connect.side_effect = error
+                with self.assertRaises(monitor.StatusError):
+                    self.client.check()
+                self.assertIsNone(self.client.ws)
+                raw.return_value.close.assert_called()
+
+    def test_redirect_is_refused_without_following_it(self):
+        ws = self.module.WebSocket.return_value
+        ws.getstatus.return_value = 302
+        with patch.object(monitor.socket, "socket"):
+            with self.assertRaises(monitor.StatusError):
+                self.client.check()
+        self.assertEqual(0, ws.connect.call_args.kwargs.get("redirect_limit"))
+        ws.send.assert_not_called()
 
     def test_unix_socket_failure_is_retryable(self):
         with patch.object(monitor.socket, "socket") as raw:
@@ -439,8 +526,17 @@ class MigrationTests(unittest.TestCase):
         self.assertIn(installer.SOURCE, migrated)
 
     def test_custom_function_is_not_overwritten(self):
-        with self.assertRaises(ValueError):
-            installer.migrate_bashrc("codex-hold() { echo custom; }\n")
+        for text in ("codex-hold() { echo custom; }\n",
+                     "codex-hold( ) { echo custom; }\n",
+                     "function codex-hold { echo custom; }\n"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                installer.migrate_bashrc(text)
+
+    def test_similarly_named_function_is_not_modified(self):
+        original = "my-" + installer.LEGACY_FUNCTION
+        migrated = installer.migrate_bashrc(original)
+        self.assertTrue(migrated.startswith(original))
+        self.assertIn(installer.SOURCE, migrated)
 
     def test_exact_notify_removed_single_and_multiline(self):
         hook = Path("/fixture/.codex/turn-done.sh")
@@ -456,6 +552,189 @@ class MigrationTests(unittest.TestCase):
                      'notify = ["bash", "/fixture/.codex/turn-done.sh", "extra"]\n',
                      '[tui]\nnotify = ["bash", "/fixture/.codex/turn-done.sh"]\n', ''):
             self.assertEqual((text, False), installer.migrate_config(text, Path("/fixture/.codex/turn-done.sh")))
+
+
+class LauncherTests(unittest.TestCase):
+    def test_relative_source_with_cdpath_survives_directory_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            launcher = Path(__file__).with_name("codex-hold.bash")
+            (project / launcher.name).write_bytes(launcher.read_bytes())
+            (project / "codex-monitor.py").write_text("print('helper reached')\n")
+            result = subprocess.run([
+                "bash", "--noprofile", "--norc", "-c",
+                'CDPATH="$PWD"; source project/codex-hold.bash; cd /; codex-hold',
+            ], cwd=root, capture_output=True, text=True, timeout=5)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("helper reached\n", result.stdout)
+
+
+class InstallationTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.home = Path(directory.name) / "desktop-user"
+        self.home.mkdir()
+        self.state = Path(directory.name) / "state"
+        self.codex = self.home / ".codex"
+        self.destination = self.home / ".local/lib/codex-turn-hold"
+        for replacement in (
+            patch.object(installer.Path, "home", return_value=self.home),
+            patch.object(installer.os, "getuid", return_value=1000),
+            patch.object(installer.importlib.util, "find_spec", return_value=object()),
+            patch.dict(os.environ, {"CODEX_HOME": str(self.codex), "XDG_STATE_HOME": str(self.state)}),
+        ):
+            replacement.start()
+            self.addCleanup(replacement.stop)
+
+    def install(self):
+        with redirect_stdout(io.StringIO()):
+            installer.install()
+        return sorted((self.state / "codex-turn-hold/backups").iterdir())[-1]
+
+    def test_first_install_and_repeat_preserve_settings(self):
+        first = self.install()
+        manifest = json.loads((first / "manifest.json").read_text())
+        self.assertTrue(all(not entry["existed"] for entry in manifest["files"].values()))
+        self.assertFalse(self.codex.exists())
+        bashrc = (self.home / ".bashrc").read_bytes()
+        second = self.install()
+        self.assertNotEqual(first, second)
+        self.assertEqual(bashrc, (self.home / ".bashrc").read_bytes())
+        self.assertEqual(bashrc, (second / "bashrc").read_bytes())
+
+    def test_migration_preserves_originals_and_file_permissions(self):
+        self.codex.mkdir()
+        self.destination.mkdir(parents=True)
+        originals = {
+            self.home / ".bashrc": (installer.LEGACY_FUNCTION, 0o640),
+            self.codex / "config.toml": (f'notify = ["bash", "{self.codex}/turn-done.sh"]\nmodel = "example"\n', 0o600),
+            self.destination / "codex-monitor.py": ("# previous helper\n", 0o640),
+            self.destination / "codex-hold.bash": ("# previous launcher\n", 0o600),
+        }
+        for path, (text, mode) in originals.items():
+            path.write_text(text)
+            path.chmod(mode)
+        backup = self.install()
+        manifest = json.loads((backup / "manifest.json").read_text())
+        self.assertTrue(manifest["removed_notify"])
+        for name, entry in manifest["files"].items():
+            path = Path(entry["path"])
+            text, mode = originals[path]
+            self.assertEqual(text, (backup / name).read_text())
+            self.assertEqual(mode, path.stat().st_mode & 0o777, path)
+            self.assertEqual(mode, (backup / name).stat().st_mode & 0o777)
+        self.assertEqual('model = "example"\n', (self.codex / "config.toml").read_text())
+
+    def test_custom_bashrc_refuses_install_before_writing(self):
+        bashrc = self.home / ".bashrc"
+        original = "codex-hold( ) { echo custom; }\n"
+        bashrc.write_text(original)
+        with self.assertRaises(ValueError):
+            self.install()
+        self.assertEqual(original, bashrc.read_text())
+        self.assertFalse(self.destination.exists())
+        self.assertFalse(self.state.exists())
+
+    def test_installed_helper_symlink_is_not_replaced(self):
+        self.destination.mkdir(parents=True)
+        target = self.home / "custom-helper.py"
+        target.write_text("# custom\n")
+        helper = self.destination / "codex-monitor.py"
+        helper.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.install()
+        self.assertTrue(helper.is_symlink())
+        self.assertFalse((self.home / ".bashrc").exists())
+
+    def test_missing_source_prevents_partial_helper_update(self):
+        self.destination.mkdir(parents=True)
+        helper = self.destination / "codex-monitor.py"
+        helper.write_bytes(b"# previous helper\n")
+        source = Path(__file__).with_name("codex-hold.bash")
+        read_bytes = Path.read_bytes
+
+        def read(path):
+            if path == source:
+                raise FileNotFoundError(str(path))
+            return read_bytes(path)
+
+        with patch.object(Path, "read_bytes", read), self.assertRaises(FileNotFoundError):
+            self.install()
+        self.assertEqual(b"# previous helper\n", helper.read_bytes())
+
+    def test_failed_atomic_replace_keeps_original_and_removes_temporary(self):
+        original = self.home / "original"
+        original.write_bytes(b"unchanged")
+        with patch.object(installer.os, "replace", side_effect=OSError("replace failed")):
+            with self.assertRaises(OSError):
+                installer.atomic_write(original, b"replacement", 0o600)
+        self.assertEqual(b"unchanged", original.read_bytes())
+        self.assertEqual([original], list(self.home.iterdir()))
+
+
+class ProcessTests(unittest.TestCase):
+    def test_real_signals_cleanup_and_duplicate_process_is_rejected(self):
+        # Real signals and flock, with fake Codex/GNOME adapters in the child only.
+        runner = '''
+from pathlib import Path
+import sys
+from test_monitor import monitor, Inhibitor
+lock, events = map(Path, sys.argv[1:])
+def record(event):
+    with events.open("a") as stream:
+        stream.write(event + "\\n")
+class LocalInhibitor(Inhibitor):
+    def __init__(self, *_):
+        super().__init__()
+    def acquire(self):
+        super().acquire()
+        record("acquire")
+    def release(self):
+        super().release()
+        record("release")
+class LocalClient:
+    path = "/fixture"
+    def __init__(self, *_):
+        pass
+    def check(self, _):
+        return monitor.Snapshot(1, 1)
+    def close(self):
+        pass
+monitor.dependency = lambda *_: None
+monitor.CodexClient = LocalClient
+monitor.GnomeInhibitor = LocalInhibitor
+monitor.lock_path = lambda: lock
+sys.exit(monitor.main([]))
+'''
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=signum), tempfile.TemporaryDirectory() as directory:
+                lock, events = (Path(directory) / name for name in ("lock", "events"))
+                command = [sys.executable, "-B", "-c", runner, str(lock), str(events)]
+                process = subprocess.Popen(command, cwd=Path(__file__).parent,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    deadline = time.monotonic() + 5
+                    while not events.exists() and process.poll() is None and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(events.exists(), "Child never acquired its fake inhibitor")
+                    duplicate = subprocess.run(command, cwd=Path(__file__).parent,
+                                               capture_output=True, text=True, timeout=5)
+                    self.assertEqual(1, duplicate.returncode)
+                    self.assertIn("already running", duplicate.stderr)
+                    process.send_signal(signum)
+                    stdout, stderr = process.communicate(timeout=5)
+                    self.assertEqual(128 + signum, process.returncode, stderr)
+                    self.assertIn("Stopped", stdout)
+                    self.assertEqual(["acquire", "release"], events.read_text().splitlines())
+                    with monitor.InstanceLock(lock):
+                        pass
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
 
 
 if __name__ == "__main__":
