@@ -1,0 +1,9 @@
+source ~/.bashrc
+codex-hold
+
+gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-timeout 60
+
+Run `sleep 180` in the terminal, wait until it finishes, and then report completion. Do not modify any files.
+
+
+
