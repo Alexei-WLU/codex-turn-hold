@@ -98,6 +98,8 @@ errors, bad pagination, timeouts, or a closed Codex socket count as failed
 checks. Even if another thread reports active work, an incomplete scan enters
 recovery. A failure while already allowing sleep never acquires a speculative
 hold. Recovered idle status after the hold expired also leaves sleep allowed.
+Malformed WebSocket handshakes, including HTTP header overflows, also enter
+status recovery.
 
 Both timers use a monotonic clock. Codex scans during recovery are bounded by
 the remaining recovery time; a result arriving at or after expiry cannot renew

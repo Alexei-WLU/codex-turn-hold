@@ -207,7 +207,7 @@ class CodexClient:
                     socket=DeadlineSocket(raw, lambda: self.remaining(self.deadline)),
                     timeout=self.remaining(deadline), suppress_origin=True, redirect_limit=0,
                 )
-            except (ValueError, IndexError) as exc:
+            except (ValueError, IndexError, OverflowError) as exc:
                 raise StatusError("Malformed Codex WebSocket handshake") from exc
             if self.ws.getstatus() != 101:
                 raise StatusError("Codex did not accept the local WebSocket upgrade")

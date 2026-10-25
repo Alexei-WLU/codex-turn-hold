@@ -397,6 +397,7 @@ class ClientTests(unittest.TestCase):
 
     def test_malformed_handshake_is_retryable(self):
         for error in (ValueError("bad HTTP status"), IndexError("missing HTTP status"),
+                      OverflowError("HTTP content length is too large"),
                       UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid header")):
             with self.subTest(error=error), patch.object(monitor.socket, "socket") as raw:
                 self.module.WebSocket.return_value.connect.side_effect = error
