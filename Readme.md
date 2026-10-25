@@ -38,12 +38,16 @@ The installer:
   (or `$XDG_STATE_HOME/codex-turn-hold/backups/`). It prints the backup path.
 - Replaces the known copied function in `.bashrc` with
   `source "$HOME/.local/lib/codex-turn-hold/codex-hold.bash"`. It refuses to
-  overwrite an unrecognized custom function or marked block.
+  overwrite an unrecognized custom function, alias, or marked block. Automatic
+  replacement requires a complete top-level shell context; examples inside
+  heredocs/quoted text and blocks inside conditionals require manual migration.
+  Shell syntax is checked with `bash -n`, without executing `.bashrc`.
 - Removes the top-level `notify` setting only when its value is exactly
   `["bash", "<CODEX_HOME>/turn-done.sh"]`, the dedicated old hook. `CODEX_HOME`
   defaults to `~/.codex`. Other notification commands and configuration stay
-  intact. Existing file permissions are preserved, including those of an
-  already-installed launcher/helper.
+  intact, including multiline strings and special TOML float values. Existing
+  file permissions are preserved, including those of an already-installed
+  launcher/helper.
 - Reads both source files and validates the migrations before updating the
   installation. Symlinked configuration files, install directories, and
   installed launcher/helper files require manual review and are left untouched.
@@ -122,6 +126,8 @@ Termination with `kill -TERM <pid>` also cleans up. Duplicate monitor processes
 for the same user are rejected. The advisory lock is under `$XDG_RUNTIME_DIR`
 or the state directory when no runtime directory is set. Its file remains after
 exit; the kernel releases the lock automatically, so do not delete it manually.
+The lock must be a regular file owned by this user, without symlinks or hard
+links to other files; unsafe lock paths are rejected before writing the PID.
 
 ## Troubleshooting and limits
 
@@ -214,7 +220,7 @@ Actual automatic suspension is not part of these checks.
 
 ### Correctness review
 
-After the fixes to scan deadlines, recovery expiry, and installation, all 47
+After the fixes to scan deadlines, recovery expiry, and installation, all 53
 tests pass, along with Bash/Python syntax, TOML parsing, and whitespace checks.
 Additional probes using the installed `websocket-client` 1.7.0 verified that
 fragmented responses and repeated ping frames stop at the scan deadline.
@@ -222,6 +228,14 @@ The repository helper's read-only `--check` succeeded against the live Codex
 0.164.0 server; locally generated schemas match the requested status fields.
 ShellCheck was unavailable. Actual suspend and the two-turn desktop lifecycle
 were not exercised during this review, and no installed files were updated.
+
+A second review added regressions for shell context and custom definitions,
+TOML NaN preservation, hard-linked lock files, interrupted GNOME initialization,
+and mixed RPC request/response fields. Read-only migration checks succeeded
+for Ubuntu's default `.bashrc` and the desktop user's current `.bashrc`, including
+repeated migration. A seeded probe checked 40,000 timer-policy transitions
+against a separate reference model. Repeated live status reads and a GNOME
+connection/owner check passed without acquiring an inhibitor.
 
 ### Original desktop installation verification
 

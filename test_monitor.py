@@ -350,7 +350,8 @@ class ClientTests(unittest.TestCase):
     def test_closed_socket_rpc_errors_and_malformed_responses_fail(self):
         responses = ("", "null", "[]", "{", '{"id":1,"error":{}}',
                      '{"id":true,"result":{}}', '{"id":2,"result":{}}',
-                     '{"id":1,"result":null}', '{"id":1,"method":"approval"}')
+                     '{"id":1,"result":null}', '{"id":1,"method":"approval"}',
+                     '{"id":1,"method":"approval","result":{"data":[]}}')
         for raw in responses:
             with self.subTest(raw=raw):
                 self.client.request_id = 0
@@ -426,6 +427,17 @@ class ClientTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_hardlinked_lock_does_not_truncate_another_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path(directory) / "original"
+            original.write_bytes(b"preserve this file")
+            path = Path(directory) / "lock"
+            os.link(original, path)
+            with self.assertRaisesRegex(monitor.MonitorError, "Unsafe"):
+                with monitor.InstanceLock(path):
+                    pass
+            self.assertEqual(b"preserve this file", original.read_bytes())
+
     def test_duplicate_lock_and_reuse_after_exit(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "monitor.lock"
@@ -512,6 +524,18 @@ class RuntimeTests(unittest.TestCase):
         bus.close.assert_called_once()
         self.assertFalse(inhibitor.held)
 
+    def test_failed_or_interrupted_gnome_constructor_closes_private_bus(self):
+        dbus = Mock(DBusException=type("DBusException", (Exception,), {}))
+        bus = dbus.SessionBus.return_value
+        for error, expected in ((monitor.StopRequested(signal.SIGTERM), monitor.StopRequested),
+                                (dbus.DBusException("no session manager"), monitor.MonitorError)):
+            with self.subTest(error=error):
+                bus.reset_mock()
+                bus.call_blocking.side_effect = error
+                with self.assertRaises(expected):
+                    monitor.GnomeInhibitor(dbus)
+                bus.close.assert_called_once()
+
 
 class MigrationTests(unittest.TestCase):
     def test_copied_bash_function_migration_preserves_surroundings(self):
@@ -528,7 +552,33 @@ class MigrationTests(unittest.TestCase):
     def test_custom_function_is_not_overwritten(self):
         for text in ("codex-hold() { echo custom; }\n",
                      "codex-hold( ) { echo custom; }\n",
-                     "function codex-hold { echo custom; }\n"):
+                     "function codex-hold { echo custom; }\n",
+                     "if true; then codex-hold() { echo custom; }; fi\n",
+                     "codex-\\\nhold() { echo custom; }\n",
+                     "function 'codex-hold' { echo custom; }\n",
+                     "alias codex-hold='echo custom'\n"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                installer.migrate_bashrc(text)
+
+    def test_legacy_text_in_heredoc_or_nested_block_is_not_rewritten(self):
+        for prefix, suffix in (("cat <<'EXAMPLE'\n", "EXAMPLE\n"),
+                               ("if true; then\n", "fi\n"),
+                               ("message=\"\n", "\"\n")):
+            for body in (installer.LEGACY_FUNCTION,
+                         installer.BEGIN + installer.SOURCE + installer.END):
+                text = prefix + body + suffix
+                with self.subTest(prefix=prefix, body=body), self.assertRaises(ValueError):
+                    installer.migrate_bashrc(text)
+
+    def test_markers_must_be_separate_ordered_lines(self):
+        for text in ("# example " + installer.BEGIN + installer.SOURCE + installer.END,
+                     installer.END + installer.BEGIN + installer.SOURCE,
+                     installer.BEGIN + installer.SOURCE + "# example " + installer.END):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                installer.migrate_bashrc(text)
+
+    def test_incomplete_shell_suffix_is_not_used_as_insertion_point(self):
+        for text in ("cat <<'EXAMPLE'\nunfinished document\n", "echo continued \\\n", "echo continued \\"):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 installer.migrate_bashrc(text)
 
@@ -552,6 +602,12 @@ class MigrationTests(unittest.TestCase):
                      'notify = ["bash", "/fixture/.codex/turn-done.sh", "extra"]\n',
                      '[tui]\nnotify = ["bash", "/fixture/.codex/turn-done.sh"]\n', ''):
             self.assertEqual((text, False), installer.migrate_config(text, Path("/fixture/.codex/turn-done.sh")))
+
+    def test_unrelated_nan_and_multiline_values_survive_notify_removal(self):
+        hook = Path("/fixture/.codex/turn-done.sh")
+        remaining = 'value = nan\narray = [1.0, -nan, +inf]\ntext = """\nnotify = ["example"]\n"""\n'
+        original = f'notify = ["bash", "{hook}"]\n' + remaining
+        self.assertEqual((remaining, True), installer.migrate_config(original, hook))
 
 
 class LauncherTests(unittest.TestCase):

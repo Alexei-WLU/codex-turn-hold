@@ -76,7 +76,8 @@ class InstanceLock:
             self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             info = os.fstat(self.fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1):
                 raise MonitorError(f"Unsafe monitor lock: {self.path}")
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -238,7 +239,8 @@ class CodexClient:
                 raise StatusError("Malformed Codex RPC response")
             if "id" not in message and isinstance(message.get("method"), str):
                 continue  # Notifications do not replace a full status check.
-            if type(message.get("id")) is not int or message["id"] != request_id:
+            if ("method" in message or type(message.get("id")) is not int
+                    or message["id"] != request_id):
                 raise StatusError("Unexpected Codex RPC response or server request")
             if "error" in message:
                 raise StatusError(f"{method} returned an RPC error")
@@ -282,12 +284,14 @@ class GnomeInhibitor:
             self.owner = self.name_owner()
             proxy = self.bus.get_object(self.owner, "/org/gnome/SessionManager", introspect=False)
             self.manager = self.dbus.Interface(proxy, "org.gnome.SessionManager")
-        except self.dbus.DBusException as exc:
+        except BaseException as exc:
             if self.bus is not None:
                 self.bus.close()
-            raise MonitorError(
-                f"Cannot connect to GNOME SessionManager; run in your desktop terminal: {exc}"
-            ) from exc
+            if isinstance(exc, self.dbus.DBusException):
+                raise MonitorError(
+                    f"Cannot connect to GNOME SessionManager; run in your desktop terminal: {exc}"
+                ) from exc
+            raise
 
     @property
     def held(self):
