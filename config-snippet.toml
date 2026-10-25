@@ -1,4 +1,5 @@
-# Merge into your user-level ~/.codex/config.toml, ABOVE the first [section] header.
+# Legacy compatibility only. The persistent monitor needs no notify setting.
+# For the old marker holder, merge ABOVE the first [section] header.
 # Replace /home/YOU with your actual absolute home path (no ~ or $HOME).
 # Running the hook through bash means it works even without the executable bit.
 # This is a snippet, not a replacement for your existing configuration.

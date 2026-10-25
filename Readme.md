@@ -1,181 +1,276 @@
-# Codex turn hold
+# Persistent Codex sleep monitor
 
-For **native Ubuntu 24.04 GNOME Desktop**, using Bash and local Codex CLI.
-Manually prevent automatic suspend during a Codex turn, then release the hold
-when Codex reports that the turn has completed. Codex stays open.
+For **Ubuntu 24.04 GNOME Desktop and Codex CLI 0.164.0**, using Bash.
+Run `codex-hold` once in a separate terminal and leave it running. It prevents
+suspend while any conversation or sub-agent on the shared local Codex server
+is working. After everything has been idle or waiting for you for **180
+continuous seconds**, it releases its hold. Later work acquires a new hold
+automatically. Starting the monitor during an existing task also works.
 
-Keep Ubuntu's **Automatic suspend: On, 30 minutes** setting. The screen may
-still blank or lock; this setup inhibits suspend only.
+The monitor changes no power, screen-blanking, or locking settings. It inhibits
+**suspend only**; your screen can still blank and lock. Releasing the hold lets
+GNOME apply its existing power policy; it does not itself request suspend or
+reset GNOME's inactivity timer. If that timer has already elapsed, automatic
+suspend can follow quickly.
 
-## Files
+## Setup and migration
 
-| File | Purpose |
+Run these commands from the repository as your normal desktop user:
+
+```bash
+sudo apt-get install python3-websocket python3-dbus
+/usr/bin/python3 -B install-monitor.py
+source "$HOME/.bashrc"
+codex-hold
+```
+
+Use the system `/usr/bin/python3`, so Ubuntu's installed modules are available.
+No pip packages, virtual environment, login service, or Codex wrapper are needed.
+The command stays in the foreground until you stop it. Start it manually again
+after closing that terminal, logging out, or rebooting.
+
+The installer:
+
+- Copies `codex-hold.bash` and `codex-monitor.py` to
+  `~/.local/lib/codex-turn-hold/`.
+- Backs up `.bashrc`, the Codex configuration, and any previous installed
+  launcher/helper under `~/.local/state/codex-turn-hold/backups/<timestamp>/`
+  (or `$XDG_STATE_HOME/codex-turn-hold/backups/`). It prints the backup path.
+- Replaces the known copied function in `.bashrc` with
+  `source "$HOME/.local/lib/codex-turn-hold/codex-hold.bash"`. It refuses to
+  overwrite an unrecognized custom function or marked block.
+- Removes the top-level `notify` setting only when its value is exactly
+  `["bash", "<CODEX_HOME>/turn-done.sh"]`, the dedicated old hook. `CODEX_HOME`
+  defaults to `~/.codex`. Other notification commands and configuration stay
+  intact. Existing file permissions are preserved.
+
+The new monitor never reads, creates, or deletes `/tmp/codex-turn-done`.
+The legacy hook file may remain installed. A running Codex server might continue
+to call its already-loaded old hook until its next normal restart; those markers
+do not affect the new monitor. There is no need to interrupt an existing task.
+
+If you already have the old `codex-hold` running, stop it with Ctrl+C before
+starting the new monitor. Source the updated `.bashrc` in the monitor terminal;
+other already-open shells may still have the old function loaded.
+
+For development without installing:
+
+```bash
+source ./codex-hold.bash
+codex-hold
+```
+
+## How the two timers work
+
+The monitor polls every two seconds. A complete scan has a five-second timeout;
+slow or failed scans may delay the next poll. Every page and every loaded thread
+is checked, including sub-agents. No conversation is resumed or subscribed to,
+and turn history is not requested.
+
+| Observation | Behavior |
 | --- | --- |
-| `turn-done.sh` | Codex notification hook; creates `/tmp/codex-turn-done`. |
-| `codex-hold.bash` | Bash function; holds GNOME suspend until the marker appears. |
-| `config-snippet.toml` | The one setting to merge into your Codex configuration. |
+| Any `active` thread with no waiting flags | Acquire one suspend hold; cancel the idle countdown. |
+| All threads `idle`, `notLoaded`, or waiting on approval/input | If holding, begin the 180-second idle countdown. |
+| Continued idle/waiting | Keep the hold until the first successful check at or after the deadline. |
+| Work resumes during the countdown | Keep the same hold without interruption; discard the countdown. |
+| Startup while already idle/waiting | Allow sleep immediately; do not acquire a hold. |
+| Any failed check | Cancel the idle countdown and begin a separate 180-second recovery deadline. |
+| Repeated failures | Keep an existing hold until that fixed deadline; retries do not extend it. |
+| Reliable status returns before recovery expires | Resume normal tracking; idle starts a fresh 180-second countdown. |
+| Recovery expires | Release the hold and keep retrying. Reliable active work can acquire it again. |
 
-The marker is shared, and the holder checks it every 30 seconds.
+Waiting flags are `waitingOnApproval` and `waitingOnUserInput`. An active
+sub-agent still keeps the hold when its parent is idle or waiting. A canceled
+turn follows the idle timer when Codex reports it as idle.
 
-## One-time setup
+Missing or malformed status, unknown status types/flags, `systemError`, RPC
+errors, bad pagination, timeouts, or a closed Codex socket count as failed
+checks. Even if another thread reports active work, an incomplete scan enters
+recovery. A failure while already allowing sleep never acquires a speculative
+hold. Recovered idle status after the hold expired also leaves sleep allowed.
 
-Extract `codex-turn-hold.zip` and open a terminal in the extracted
-`codex-turn-hold` folder. Run the setup as your normal desktop user.
+Both timers use a monotonic clock. Checks during recovery are bounded by the
+remaining recovery time. A Codex disconnect triggers recovery and reconnection;
+a GNOME session-bus failure is fatal and prints an error. The inhibitor is
+owned by a private D-Bus connection and released on Ctrl+C, SIGTERM, SIGHUP,
+or normal cleanup. GNOME removes it if the process crashes or its D-Bus
+connection closes.
 
-### 1. Install the hook
+## Messages and stopping
+
+Messages appear on transitions, rather than on every poll:
+
+| Message | Meaning |
+| --- | --- |
+| `Active work; suspend inhibited.` | The monitor acquired its hold. |
+| `All threads idle or waiting; allowing sleep in 180s if this continues.` | The idle countdown has started; the hold remains. |
+| `Active work resumed; keeping suspend inhibited.` | The countdown was canceled without releasing the hold. |
+| `Status unavailable (...); keeping the existing hold for up to 180s; retrying.` | Status recovery has started. |
+| `Status recovered.` | A complete, valid status scan succeeded again. |
+| `Sleep allowed; ...` | This monitor owns no inhibitor; it continues checking. Other applications may still inhibit suspend. |
+
+Press **Ctrl+C in the monitor terminal** to stop it and release its hold.
+Termination with `kill -TERM <pid>` also cleans up. Duplicate monitor processes
+for the same user are rejected. The advisory lock is under `$XDG_RUNTIME_DIR`
+or the state directory when no runtime directory is set. Its file remains after
+exit; the kernel releases the lock automatically, so do not delete it manually.
+
+## Troubleshooting and limits
+
+- **Missing dependency:** run the package installation above. The launcher
+  deliberately uses `/usr/bin/python3`, regardless of your shell's Python.
+- **GNOME connection error:** run in a terminal in your logged-in GNOME session,
+  as the desktop user, without `sudo`. SSH sessions and other desktop
+  environments are outside the target setup.
+- **Status unavailable:** check that a normal `codex` terminal is open and that
+  `CODEX_HOME` matches. The default socket is
+  `~/.codex/app-server-control/app-server-control.sock`. The monitor does not
+  start or restart Codex. Starting it before Codex is fine: it retries while
+  allowing sleep. For a read-only diagnostic that acquires no inhibitor:
+
+  ```bash
+  codex-hold --check
+  ```
+
+  This prints counts of loaded and working threads, or exits with a clear error.
+  It prints no conversation titles, prompts, or history.
+- **Already running:** use the existing monitor terminal. If its lock really is
+  held, a process still owns it; an old lock file by itself is harmless.
+- **Unexpected persistent hold:** inspect `gnome-session-inhibit --list` for
+  the owner. The new app id is `codex-turn-hold`, with reason
+  `Codex work or idle grace period`. Old marker holders and Codex's own
+  sleep-prevention feature can own separate inhibitors.
+- **Codex upgrades:** this integration targets CLI 0.164.0. New status flags or
+  a changed local transport fail into bounded recovery; run the tests and
+  read-only diagnostic after upgrades before relying on it.
+
+Only the shared local server selected by `CODEX_HOME` is covered. Isolated
+Codex runs, other servers/users, and commands left running after Codex becomes
+idle are excluded. Activity shorter than the polling interval can be missed.
+Thread enumeration is not an atomic snapshot; the next poll observes newly
+loaded work. The hold cannot override forced suspend, logout, shutdown, or
+every laptop lid policy. No guarantee of continued work is made during an
+outage beyond the recovery deadline.
+
+`turn-done.sh` and `config-snippet.toml` remain **legacy compatibility examples**.
+The hook intentionally matches `agent-turn-complete` anywhere in its last
+argument and writes the shared marker. Do not add its `notify` setting for the
+persistent monitor. Custom notification commands can remain configured.
+
+## Verification
+
+Run the repeatable checks from the repository:
 
 ```bash
-mkdir -p "$HOME/.codex"
-install -m 755 turn-done.sh "$HOME/.codex/turn-done.sh"
+bash -n codex-hold.bash && bash -n turn-done.sh
+/usr/bin/python3 -B -m unittest -v
+/usr/bin/python3 -B - <<'PY'
+import ast
+from pathlib import Path
+for path in Path('.').glob('*.py'):
+    ast.parse(path.read_text(), filename=str(path))
+PY
+# When installed:
+shellcheck codex-hold.bash turn-done.sh
 ```
 
-This copies the hook and makes it executable, so it can also be run directly.
+The standard-library tests use a simulated clock and fake transports/inhibitors.
+They cover repeated turns, overlapping conversations, active sub-agents, both
+waiting states, cancellation, startup during work, pagination, malformed
+responses, socket closure, reconnection, both timer boundaries, recovery,
+duplicate locks, cleanup, and conservative migration. They do not touch the
+shared completion marker or change any desktop setting.
 
-### 2. Configure Codex
+For a two-turn desktop check, stay at the PC; releasing an inhibitor may permit
+an already-due automatic suspend:
 
-Add this line to your existing user-level `~/.codex/config.toml`, **above the
-first `[section]` header**:
+1. Open normal Codex and start `codex-hold` in another terminal. If everything
+   is idle, it should report sleep allowed.
+2. Submit a task that takes longer than two seconds. Run
+   `gnome-session-inhibit --list` while it is working and confirm one
+   `codex-turn-hold` suspend inhibitor.
+3. After the task finishes, check that the inhibitor remains before 180 seconds
+   and disappears on the first poll afterward. The monitor stays running.
+4. Submit a second task. Confirm it reacquires a hold automatically. During its
+   subsequent idle countdown, submit more work before 180 seconds: the same
+   hold should remain, and the countdown should restart after work ends.
+5. Press Ctrl+C and confirm that this monitor's inhibitor disappears. GNOME's
+   power, screen-blanking, and lock settings should be unchanged.
 
-```toml
-notify = ["bash", "/home/YOU/.codex/turn-done.sh"]
+Actual automatic suspension is not part of these checks.
+
+### Verification on this PC
+
+Installed and verified on 2026-10-24 (America/Toronto), with Ubuntu 24.04.5
+GNOME Wayland, Codex CLI 0.164.0, Python 3.12.3, `python3-websocket` 1.7.0-1,
+and `python3-dbus` 1.3.2-5build3.
+
+- All 32 unit tests, Bash/Python syntax checks, TOML parsing, and
+  `git diff --check` passed. ShellCheck was unavailable on this PC.
+- Twelve desktop verification groups passed. These used real GNOME inhibitors
+  with a simulated clock to check both 180-second deadlines, uninterrupted
+  holds, repeated work, recovery, and reacquisition. A temporary independent
+  suspend guard covered the verification and was removed afterward.
+- A read-only probe exercised multiple pages of the actual shared Codex
+  server. The implemented diagnostic read three loaded threads, including the
+  active conversation, without requesting turn history.
+- Real monitor processes passed duplicate detection, SIGTERM, SIGHUP,
+  SIGKILL/crash cleanup, and Ctrl+C through a pseudo-terminal using the Bash
+  launcher. All verification inhibitors were removed.
+- Installed files match the repository. The migrated configuration differs
+  only by removal of the dedicated legacy `notify`. Backups, original file
+  permissions, fresh interactive Bash loading, and unchanged power, blanking,
+  and locking settings were verified.
+
+This verifies status reads and inhibitor behavior; the real-time two-turn
+manual check above and actual automatic suspend were not run. No existing
+Codex task was interrupted or restarted. The monitor is installed and ready
+for manual startup, with no background monitor left by the verification.
+
+This installation's backups, `manifest.json`, `verification-results.json`, and
+desktop verifier are under:
+
+```text
+~/.local/state/codex-turn-hold/backups/20261025T003923.332003Z/
 ```
 
-Replace `/home/YOU` with your actual home path (`echo "$HOME"` displays it).
-Do not use `~` or `$HOME` inside the TOML string. Keep your other settings.
-Running the hook through `bash` means it still works if the file ever loses its
-executable bit. Codex ignores `notify` in project-level `.codex/config.toml`
-files, so it must be in the user-level file.
+## Rollback
 
-If you already have `notify` configured, keep that command and add
-`touch /tmp/codex-turn-done` to its existing `agent-turn-complete` handler
-instead. Do not add a second `notify` key. Write the marker before any desktop
-alert command that might fail.
-
-### 3. Add the Bash function
-
-Copy the function in `codex-hold.bash` into `~/.bashrc`, replacing any earlier
-`codex-hold` definition. Load it in the terminal where you will run the holder:
+Stop the new monitor first. Use the backup directory printed by the installer.
+`manifest.json` records original paths and whether each file existed:
 
 ```bash
+backup_dir="$HOME/.local/state/codex-turn-hold/backups/<timestamp>"
+cp -p "$backup_dir/bashrc" "$HOME/.bashrc"
+# Only if config.toml existed; use its original path from manifest.json:
+cp -p "$backup_dir/config.toml" "${CODEX_HOME:-$HOME/.codex}/config.toml"
+unset -f codex-hold
 source "$HOME/.bashrc"
 ```
 
-Exit and reopen Codex after changing its configuration, when no task is running.
+Restoring these files also restores their other settings as of the backup;
+merge the relevant lines instead if you made later changes. For a previous
+persistent installation, restore the backed-up `codex-hold.bash` and
+`codex-monitor.py` into `~/.local/lib/codex-turn-hold/`. For a first installation,
+that directory can be removed once no shell sources it. The legacy hook is
+left in place for rollback. Let Codex reload the restored notification setting
+at its next normal restart when no task is running.
 
-## Usage for each long turn
+## Files and references
 
-1. Start Codex normally with `codex` and leave it waiting for your task.
-2. In a second terminal, run:
+All project files remain at the repository root:
 
-   ```bash
-   codex-hold
-   ```
+| File | Purpose |
+| --- | --- |
+| `codex-hold.bash` | Sourced Bash launcher using the system Python. |
+| `codex-monitor.py` | Local status client, two timers, single-instance lock, GNOME inhibitor. |
+| `install-monitor.py` | Installation, backups, and migration of known old settings. |
+| `test_monitor.py` | Standard-library unit tests with simulated time. |
+| `turn-done.sh`, `config-snippet.toml` | Legacy marker hook and notification example. |
 
-   It normally waits silently. Leave this terminal open. If it reports an error
-   or returns immediately, check the error before relying on the hold.
-3. **Now submit your task in Codex.** Start the holder before submitting the
-   task so it cannot erase a completion marker that has already arrived.
-4. When Codex completes the turn, the hook creates the marker. The holder exits
-   on its next check (within about 30 seconds), and Ubuntu's normal
-   automatic-suspend policy resumes.
-
-   **Expect a fast suspend.** GNOME counts idle time from your last keyboard or
-   mouse input, not from the release. If you have been away longer than the
-   30-minute delay, the PC suspends within seconds of the holder exiting, not
-   30 minutes later. This is normal. Codex is still open at its prompt when you
-   wake the machine.
-5. Run `codex-hold` again **before** submitting the next long turn.
-
-There is no need for a wrapper around the Codex process. This setup does not
-depend on Codex's experimental **Prevent sleep while running** toggle (in
-`/experimental`). That feature is new, and GNOME's automatic suspend does not
-honor systemd-level inhibitors taken by the same user, so it is not relied on
-here.
-
-## Quick verification on your PC
-
-Before relying on it for a long task:
-
-1. Start `codex-hold`.
-2. In another terminal, run `gnome-session-inhibit --list`. Look for the
-   inhibition with reason **Codex task running**.
-3. Ask Codex: **Reply with DONE.** Wait for it to finish.
-4. Within about 30 seconds, the holder should return to its shell prompt.
-   Run `gnome-session-inhibit --list` again; that inhibition should be gone.
-
-If `gnome-session-inhibit` is missing, install its Ubuntu package:
-
-```bash
-sudo apt install gnome-session-bin
-```
-
-If the hold remains after Codex finishes, check the configured absolute path
-and that Codex was restarted after the setting was added. You can also run the
-hook by hand; it should create the marker:
-
-```bash
-bash "$HOME/.codex/turn-done.sh" '{"type":"agent-turn-complete"}'
-ls -l /tmp/codex-turn-done
-```
-
-## Limits and manual stop
-
-- If you cancel a task, Codex crashes, or the notification fails, the holder
-  may keep running. Press **Ctrl+C in the holder's terminal** to release it.
-- An approval or input prompt during a turn does not necessarily end that turn.
-  The automatic release follows the completion notification.
-- Any completion that invokes this hook can release the shared hold. Suspend
-  timing afterward is controlled by Ubuntu, not this script.
-- The supplied hook matches `agent-turn-complete` anywhere in its final
-  argument. Unrelated or malformed input containing that text also creates the
-  marker. This behavior is retained intentionally; use Codex notification
-  payloads with the hook.
-
-## Verification and references
-
-Earlier script verification on 2026-10-24: both shell files passed `bash -n`
-and ShellCheck 0.11 with no findings; the TOML snippet parses, and placing it
-below a `[section]` header was confirmed to misfile the key under that section.
-`turn-done.sh` was run with a Codex-style `agent-turn-complete` payload, with
-another event type, and with
-no arguments. `codex-hold` was exercised against a stand-in
-`gnome-session-inhibit` that checks option order: a stale marker is cleared at
-start, the hold releases within one 30-second poll after the marker appears, an
-unremovable marker makes the function fail before inhibiting, and Ctrl+C through
-a pseudo-terminal terminates the holder. Both reference links were fetched and
-confirm the `notify` and `gnome-session-inhibit` behaviour described above.
-
-The quick check above verifies actual notification delivery and inhibitor
-registration on your PC. Actual automatic suspension was not tested here.
-
-### Desktop installation verification
-
-Installed and verified on the target Ubuntu 24.04.5 GNOME Wayland desktop on
-2026-10-24, using Codex CLI 0.164.0 and `gnome-session-bin` 46.0-1ubuntu4.
-The supplied scripts were installed unchanged. AC automatic suspend is enabled
-with a 1,800-second timeout; all other power, screen blanking, and locking
-settings were preserved.
-
-Eleven verification groups passed, including Bash syntax, TOML parsing,
-preservation of existing Codex settings and file permissions, exact hook-copy
-comparison, and loading the supplied function in a fresh interactive Bash
-shell. ShellCheck was unavailable on this desktop and was not rerun.
-
-- Completion, unrelated-event, empty-argument, and direct hook execution
-  behaved as expected. The accepted broad text matching was also reproduced.
-- The holder cleared a stale marker, registered a real GNOME suspend-only
-  inhibitor, and released it 29.44 seconds after the hook ran. An unremovable
-  marker prevented inhibition, and Ctrl+C through a terminal removed the
-  inhibitor.
-- A fresh, ephemeral, read-only Codex session replied `DONE` in 5.91 seconds.
-  Its actual notification created the marker, and the holder released
-  24.62 seconds after the marker was observed. The running Codex daemon was
-  not restarted.
-
-These checks took 60.33 seconds. They verified notification delivery and the
-GNOME inhibitor lifecycle without triggering an actual suspend. Configuration
-backups, original power settings, and `verification-results.json` are kept
-outside the repository under `~/.local/state/codex-turn-hold/backups/`.
-
-- [Codex notify documentation](https://learn.chatgpt.com/docs/config-file/config-advanced#notifications)
-- [Ubuntu 24.04 gnome-session-inhibit manual](https://manpages.ubuntu.com/manpages/noble/man1/gnome-session-inhibit.1.html)
+The transport and metadata-only status reads follow the
+[Codex app-server documentation](https://learn.chatgpt.com/docs/app-server#read-a-stored-thread-without-resuming).
+The 0.164.0 schemas generated locally with `codex app-server generate-json-schema`
+confirm the pagination and status fields. The GNOME hold uses `Inhibit` with
+flag `4` and `Uninhibit`, as described in the
+[GNOME SessionManager D-Bus documentation](https://gnome.pages.gitlab.gnome.org/gnome-session/re04.html).

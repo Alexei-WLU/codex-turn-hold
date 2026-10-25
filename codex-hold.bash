@@ -1,11 +1,9 @@
-# Add this function to ~/.bashrc.
-# Start it BEFORE submitting a task in Codex; leave its terminal open.
-codex-hold() {
-  rm -f /tmp/codex-turn-done || return
+# Source this file from ~/.bashrc; leave codex-hold running in one terminal.
+# Resolve the helper when sourced, so later directory changes do not affect it.
+_CODEX_HOLD_HELPER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/codex-monitor.py" || return
 
-  gnome-session-inhibit \
-    --inhibit suspend \
-    --reason "Codex task running" \
-    --app-id codex \
-    bash -c 'until [ -e /tmp/codex-turn-done ]; do sleep 30; done'
-}
+# Exec replaces only the function's subshell, keeping the calling shell open.
+# System Python supplies Ubuntu's packaged websocket and dbus modules.
+codex-hold() (
+  exec /usr/bin/python3 -B "$_CODEX_HOLD_HELPER" "$@"
+)
