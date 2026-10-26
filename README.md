@@ -50,8 +50,8 @@ The installer:
 **Upgrading from the old marker script:** stop the old holder first. Installation
 replaces its known function and removes only the dedicated
 `notify = ["bash", "<CODEX_HOME>/turn-done.sh"]` setting. Other notification
-commands remain. `turn-done.sh` and `config-snippet.toml` are legacy examples;
-the new monitor never uses `/tmp/codex-turn-done`.
+commands remain. The old hook and notification example are archived in
+[`legacy/`](legacy/README.md); the new monitor never uses `/tmp/codex-turn-done`.
 
 ## Use
 
@@ -153,16 +153,11 @@ For rollback, use the backup's `manifest.json` to copy saved files to their
 original paths, merging any later configuration edits. Then run
 `unset -f codex-hold` and `source "$HOME/.bashrc"`. Backups can be kept after removal.
 
-## Development checks
+## Contributing
 
-From the repository directory:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the project layout, local checks,
+GitHub Actions workflow, and pull request guidance.
 
-```bash
-/usr/bin/python3 -B -m unittest -v
-bash -n codex-hold.bash && bash -n turn-done.sh
-```
+## License
 
-Tests cover timers, recovery, malformed responses, pagination/sub-agents,
-duplicate instances, signals, and installation using isolated fixtures.
-They do not change desktop settings. Optional shell lint:
-`shellcheck codex-hold.bash turn-done.sh`.
+[MIT](LICENSE), copyright (c) 2026 Alex.

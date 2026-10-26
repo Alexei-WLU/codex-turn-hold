@@ -1,0 +1,35 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Python and Bash
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck
+
+      - name: Run unit tests
+        run: /usr/bin/python3 -B -m unittest -v
+
+      - name: Check Bash syntax
+        run: |
+          bash -n codex-hold.bash
+          bash -n legacy/turn-done.sh
+
+      - name: Run ShellCheck
+        run: shellcheck --shell=bash codex-hold.bash legacy/turn-done.sh

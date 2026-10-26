@@ -1,0 +1,2 @@
+# Keep text files usable by Ubuntu's shell and system Python.
+* text=auto eol=lf
